@@ -348,6 +348,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model_config.enable_return_sampling_mask
                 ),
             )
+            if (
+                self.model_config.enable_return_sampling_mask
+                and self.sampler.use_flashinfer
+            ):
+                logger.info_once(
+                    "FlashInfer sampling is disabled when returning sampling masks."
+                )
             custom = self.model_state.custom_sampler(self.sampler)
 
             if custom:
