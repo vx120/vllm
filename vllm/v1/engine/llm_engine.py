@@ -388,6 +388,7 @@ class LLMEngine:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         if self._profile_session_active:
             raise ProfilerAlreadyActiveError()
@@ -401,6 +402,7 @@ class LLMEngine:
                 profile_prefix,
                 delay_iterations,
                 max_iterations,
+                profiler_kwargs=profiler_kwargs,
             )
         except BaseException:
             self._profile_session_active = False
