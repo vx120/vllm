@@ -467,6 +467,7 @@ class ExecuteModelState(NamedTuple):
 
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
+    logits_indices: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -4247,6 +4248,7 @@ class GPUModelRunner(
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
+            logits_indices,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4298,6 +4300,7 @@ class GPUModelRunner(
         (
             scheduler_output,
             logits,
+            logits_indices,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4309,15 +4312,6 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
-
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
 
         hidden_capture_chunks = None
         hidden_capture_errors = None
@@ -4346,7 +4340,18 @@ class GPUModelRunner(
                     hidden_states,
                     aux_hidden_states,
                     self.query_start_loc.np,
+                    logits=logits,
+                    logits_indices=logits_indices,
                 )
+
+        # Apply structured output bitmasks if present.
+        if grammar_output is not None:
+            apply_grammar_bitmask(
+                scheduler_output, grammar_output, self.input_batch, logits
+            )
+
+        with record_function_or_nullcontext("gpu_model_runner: sample"):
+            sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

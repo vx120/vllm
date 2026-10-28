@@ -29,6 +29,7 @@ class HiddenStateCapturePlan:
     min_rows: int = 1
     aux_layer_ids: tuple[int, ...] = ()
     hidden_layout: str = "final"
+    logprob_topk: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -45,6 +46,8 @@ class HiddenStateCapturePlan:
             raise ValueError("Hidden-state layout does not match auxiliary layers")
         if len(set(self.aux_layer_ids)) != len(self.aux_layer_ids):
             raise ValueError("Duplicate auxiliary hidden-state layers")
+        if not isinstance(self.logprob_topk, int) or self.logprob_topk < 0:
+            raise ValueError("logprob_topk must be a nonnegative integer")
 
     @classmethod
     def from_window(
@@ -59,6 +62,7 @@ class HiddenStateCapturePlan:
         min_rows: int = 1,
         aux_layer_ids: tuple[int, ...] = (),
         hidden_layout: str | None = None,
+        logprob_topk: int = 0,
     ) -> HiddenStateCapturePlan:
         if coordinate == "response":
             offset = prompt_len - 1
@@ -75,6 +79,7 @@ class HiddenStateCapturePlan:
             min_rows=min_rows,
             aux_layer_ids=aux_layer_ids,
             hidden_layout=hidden_layout or ("aux_final" if aux_layer_ids else "final"),
+            logprob_topk=logprob_topk,
         )
 
 
@@ -115,6 +120,13 @@ def validate_hidden_state_capture(
         raise VLLMValidationError("Hidden-state capture requires a single completion")
     if params.stop:
         raise VLLMValidationError("Hidden-state capture does not support stop strings")
+    if plan.logprob_topk:
+        if plan.logprob_topk > vllm_config.model_config.get_vocab_size():
+            raise VLLMValidationError("logprob_topk exceeds the model vocabulary")
+        if vllm_config.parallel_config.enable_batch_sharded_sampling:
+            raise VLLMValidationError(
+                "Window logprobs do not support batch-sharded sampling"
+            )
     prompt_len = length_from_prompt_token_ids_or_embeds(
         request.prompt_token_ids, request.prompt_embeds
     )
@@ -132,6 +144,8 @@ class HiddenStateCaptureChunk:
     hidden_states: torch.Tensor
     copied_bytes: int = 0
     copy_ms: float = 0.0
+    logprobs: torch.Tensor | None = None
+    logprob_token_ids: torch.Tensor | None = None
 
     def accepted(self, start: int, end: int) -> HiddenStateCaptureChunk:
         keep = (self.positions >= start) & (self.positions < end)
@@ -140,6 +154,12 @@ class HiddenStateCaptureChunk:
             self.hidden_states[torch.from_numpy(keep)],
             self.copied_bytes,
             self.copy_ms,
+            self.logprobs[torch.from_numpy(keep)]
+            if self.logprobs is not None
+            else None,
+            self.logprob_token_ids[torch.from_numpy(keep)]
+            if self.logprob_token_ids is not None
+            else None,
         )
 
 
@@ -175,6 +195,8 @@ def capture_scheduled_hidden_states(
     query_start_loc: np.ndarray | None = None,
     *,
     non_blocking: bool = False,
+    logits: torch.Tensor | None = None,
+    logits_indices: torch.Tensor | None = None,
 ) -> dict[str, HiddenStateCaptureChunk]:
     """Copy scheduled window rows, optionally deferring completion to the runner.
 
@@ -211,17 +233,43 @@ def capture_scheduled_hidden_states(
                     states = torch.cat(parts, dim=-1)
                 else:
                     states = hidden_states[first_row:end_row]
+                values = token_ids = None
+                if plan.logprob_topk:
+                    if logits is None or logits_indices is None:
+                        raise ValueError(
+                            "Window logprobs require raw logits and indices"
+                        )
+                    rows = torch.arange(first_row, end_row, device=logits.device)
+                    indices = torch.searchsorted(logits_indices.contiguous(), rows)
+                    indices = indices.clamp(max=logits_indices.numel() - 1)
+                    torch._assert_async(
+                        (logits_indices[indices] == rows).all(),
+                        "Captured hidden rows have no corresponding logits",
+                    )
+                    scores = logits[indices].float()
+                    values, token_ids = scores.topk(plan.logprob_topk, dim=-1)
+                    values = values - scores.logsumexp(dim=-1, keepdim=True)
                 copy_started = perf_counter()
-                if non_blocking and states.device.type == "cuda":
-                    cpu_states = torch.empty_like(states, device="cpu", pin_memory=True)
-                    cpu_states.copy_(states.detach(), non_blocking=True)
-                else:
-                    cpu_states = states.detach().to("cpu")
+                tensors = [states]
+                if values is not None:
+                    tensors.extend([values, token_ids])
+                cpu_tensors = []
+                for tensor in tensors:
+                    if non_blocking and tensor.device.type == "cuda":
+                        cpu_tensor = torch.empty_like(
+                            tensor, device="cpu", pin_memory=True
+                        )
+                        cpu_tensor.copy_(tensor.detach(), non_blocking=True)
+                    else:
+                        cpu_tensor = tensor.detach().to("cpu")
+                    cpu_tensors.append(cpu_tensor)
                 chunks[req_id] = HiddenStateCaptureChunk(
                     positions=np.arange(first, end, dtype=np.int64),
-                    hidden_states=cpu_states,
+                    hidden_states=cpu_tensors[0],
+                    logprobs=cpu_tensors[1] if values is not None else None,
+                    logprob_token_ids=cpu_tensors[2] if values is not None else None,
                     copied_bytes=(
-                        states.numel() * states.element_size()
+                        sum(t.numel() * t.element_size() for t in tensors)
                         if states.device.type != "cpu"
                         else 0
                     ),
@@ -250,6 +298,8 @@ class HiddenStateCaptureResult:
     collection_id: str
     copied_bytes: int = 0
     copy_ms: float = 0.0
+    logprobs: torch.Tensor | None = None
+    logprob_token_ids: torch.Tensor | None = None
 
 
 @dataclass
@@ -272,6 +322,19 @@ class HiddenStateCaptureBuffer:
         states = torch.cat([chunk.hidden_states for chunk in self.chunks])
         positions, unique_indices = np.unique(positions, return_index=True)
         states = states[torch.from_numpy(unique_indices)]
+        logprobs = token_ids = None
+        if self.plan.logprob_topk:
+            if any(
+                chunk.logprobs is None or chunk.logprob_token_ids is None
+                for chunk in self.chunks
+            ):
+                raise ValueError("Captured window has missing logprob rows")
+            logprobs = torch.cat([c.logprobs for c in self.chunks])[
+                torch.from_numpy(unique_indices)
+            ]
+            token_ids = torch.cat([c.logprob_token_ids for c in self.chunks])[
+                torch.from_numpy(unique_indices)
+            ]
         if len(positions) < self.plan.min_rows:
             return None
         return HiddenStateCaptureResult(
@@ -288,6 +351,8 @@ class HiddenStateCaptureBuffer:
             collection_id=self.plan.collection_id,
             copied_bytes=self.copied_bytes,
             copy_ms=self.copy_ms,
+            logprobs=logprobs,
+            logprob_token_ids=token_ids,
         )
 
     def update(

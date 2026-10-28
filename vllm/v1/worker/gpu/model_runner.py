@@ -74,6 +74,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.hidden_state_capture import (
+    HiddenStateCaptureChunk,
     HiddenStateCapturePlan,
     capture_scheduled_hidden_states,
     drop_incompatible_aux_plans,
@@ -1638,12 +1639,67 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _capture_hidden_states(
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        logits: torch.Tensor,
+    ) -> tuple[dict[str, HiddenStateCaptureChunk] | None, dict[str, str] | None]:
+        hidden_capture_chunks = None
+        hidden_capture_errors = None
+        if self.hidden_state_capture_plans:
+            hidden_capture_errors = drop_incompatible_aux_plans(
+                self.hidden_state_capture_plans,
+                input_batch.req_ids,
+                self.hidden_state_capture_aux_layer_ids,
+                aux_hidden_states,
+            )
+            for req_id in hidden_capture_errors:
+                logger.warning(
+                    "Hidden-state capture unavailable for %s: aux layers", req_id
+                )
+            if self.hidden_state_capture_plans:
+                num_scheduled = {
+                    req_id: int(
+                        input_batch.query_start_loc_np[i + 1]
+                        - input_batch.query_start_loc_np[i]
+                    )
+                    for i, req_id in enumerate(input_batch.req_ids)
+                }
+                computed = {
+                    req_id: int(input_batch.num_computed_tokens_np[i])
+                    for i, req_id in enumerate(input_batch.req_ids)
+                }
+                hidden_capture_chunks = capture_scheduled_hidden_states(
+                    self.hidden_state_capture_plans,
+                    input_batch.req_ids,
+                    num_scheduled,
+                    computed,
+                    hidden_states,
+                    aux_hidden_states,
+                    input_batch.query_start_loc_np,
+                    # AsyncOutput waits for this stream before exposing CPU rows.
+                    non_blocking=True,
+                    logits=logits,
+                    logits_indices=input_batch.logits_indices,
+                )
+
+        return hidden_capture_chunks, hidden_capture_errors
+
     def sample(
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
-    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        aux_hidden_states: list[torch.Tensor] | None = None,
+    ) -> tuple[
+        SamplerOutput,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, HiddenStateCaptureChunk] | None,
+        dict[str, str] | None,
+    ]:
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1662,6 +1718,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
+
+        hidden_capture_chunks, hidden_capture_errors = self._capture_hidden_states(
+            global_input_batch, hidden_states, aux_hidden_states, logits
+        )
 
         invalid_drafts = None
         # A diffusion prefill has no logit rows even when a bitmask row
@@ -1723,7 +1783,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert sampler_output is not None
-        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+        return (
+            sampler_output,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+            hidden_capture_chunks,
+            hidden_capture_errors,
+        )
 
     def postprocess_sampled(
         self,
@@ -2195,9 +2261,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        (
+            sampler_output,
+            num_sampled,
+            num_rejected,
+            hidden_capture_chunks,
+            hidden_capture_errors,
+        ) = self.sample(hidden_states, input_batch, grammar_output, aux_hidden_states)
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2225,43 +2295,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.prompt_len.np,
             )
         )
-
-        hidden_capture_chunks = None
-        hidden_capture_errors = None
-        if self.hidden_state_capture_plans:
-            hidden_capture_errors = drop_incompatible_aux_plans(
-                self.hidden_state_capture_plans,
-                input_batch.req_ids,
-                self.hidden_state_capture_aux_layer_ids,
-                aux_hidden_states,
-            )
-            for req_id in hidden_capture_errors:
-                logger.warning(
-                    "Hidden-state capture unavailable for %s: aux layers", req_id
-                )
-            if self.hidden_state_capture_plans:
-                num_scheduled = {
-                    req_id: int(
-                        input_batch.query_start_loc_np[i + 1]
-                        - input_batch.query_start_loc_np[i]
-                    )
-                    for i, req_id in enumerate(input_batch.req_ids)
-                }
-                computed = {
-                    req_id: int(input_batch.num_computed_tokens_np[i])
-                    for i, req_id in enumerate(input_batch.req_ids)
-                }
-                hidden_capture_chunks = capture_scheduled_hidden_states(
-                    self.hidden_state_capture_plans,
-                    input_batch.req_ids,
-                    num_scheduled,
-                    computed,
-                    hidden_states,
-                    aux_hidden_states,
-                    input_batch.query_start_loc_np,
-                    # AsyncOutput waits for this stream before exposing CPU rows.
-                    non_blocking=True,
-                )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(

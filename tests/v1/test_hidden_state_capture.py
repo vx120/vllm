@@ -29,6 +29,35 @@ def test_hidden_capture_window_uses_teacher_forcing_positions():
         HiddenStateCapturePlan.from_window("req", 17, 2000, 1000, "collection")
 
 
+def test_window_logprobs_follow_accepted_hidden_rows_and_retry_deduplication():
+    """Raw top-k labels must stay aligned when speculation rejects a suffix."""
+    plan = HiddenStateCapturePlan.from_window(
+        "req", 4, 0, 3, "collection", logprob_topk=2
+    )
+    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    logits = torch.tensor(
+        [[1.0, 2.0, 4.0, 0.0], [2.0, 1.0, 0.0, 3.0], [4.0, 1.0, 0.0, 2.0]]
+    )
+    chunk = capture_scheduled_hidden_states(
+        {"req": plan},
+        ["req"],
+        {"req": 6},
+        {"req": 0},
+        hidden,
+        logits=logits,
+        logits_indices=torch.tensor([3, 4, 5]),
+    )["req"]
+    expected_values, expected_ids = logits.log_softmax(-1).topk(2, dim=-1)
+    buffer = HiddenStateCaptureBuffer(plan)
+    buffer.add(chunk.accepted(3, 5))
+    buffer.add(chunk.accepted(4, 6))
+    result = buffer.finish()
+    np.testing.assert_array_equal(result.hidden_positions, [3, 4, 5])
+    torch.testing.assert_close(result.hidden_states, hidden[3:6])
+    torch.testing.assert_close(result.logprobs, expected_values)
+    assert torch.equal(result.logprob_token_ids, expected_ids)
+
+
 def test_hidden_capture_selects_only_each_requests_window_rows():
     plans = {
         "a": HiddenStateCapturePlan.from_window("a", 4, 0, 2, "a"),
@@ -175,7 +204,8 @@ def test_hidden_capture_keeps_bfloat16_on_cpu(non_blocking):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("layout", ["final", "aux_final", "dflash_aux"])
-def test_hidden_capture_async_rows_survive_graph_output_reuse(layout):
+@pytest.mark.parametrize("logprob_topk", [0, 2])
+def test_hidden_capture_async_rows_survive_graph_output_reuse(layout, logprob_topk):
     """The runner's output event makes copies readable despite graph replay reuse."""
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.worker.gpu.async_utils import AsyncOutput
@@ -188,7 +218,14 @@ def test_hidden_capture_async_rows_survive_graph_output_reuse(layout):
     aux_ids = () if layout == "final" else (3,)
     plans = {
         req: HiddenStateCapturePlan.from_window(
-            req, 1, 1, 3, req, aux_layer_ids=aux_ids, hidden_layout=layout
+            req,
+            1,
+            1,
+            3,
+            req,
+            aux_layer_ids=aux_ids,
+            hidden_layout=layout,
+            logprob_topk=logprob_topk,
         )
         for req in ("a", "c")
     }
@@ -210,6 +247,8 @@ def test_hidden_capture_async_rows_survive_graph_output_reuse(layout):
                 hidden,
                 [aux] if aux_ids else None,
                 non_blocking=True,
+                logits=hidden.float(),
+                logits_indices=torch.arange(6, device="cuda"),
             )
             counts = torch.ones(2, dtype=torch.int32, device="cuda")
             sampled = SamplerOutput(
@@ -243,15 +282,24 @@ def test_hidden_capture_async_rows_survive_graph_output_reuse(layout):
         for req, offset in (("a", 0), ("c", 4)):
             expected = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
             expected = expected[offset : offset + 2] + step * 20
+            raw_logits = expected.float()
             if layout == "aux_final":
                 expected = torch.cat((expected + 100, expected), dim=-1)
             elif layout == "dflash_aux":
                 expected = expected + 100
             chunk = chunks[req]
             assert chunk.hidden_states.is_pinned()
-            assert chunk.copied_bytes == expected.numel() * expected.element_size()
+            assert chunk.copied_bytes == (
+                expected.numel() * expected.element_size() + 2 * logprob_topk * 12
+            )
             np.testing.assert_array_equal(chunk.positions, [1, 2])
             torch.testing.assert_close(chunk.hidden_states, expected)
+            if logprob_topk:
+                values, ids = raw_logits.log_softmax(-1).topk(logprob_topk, dim=-1)
+                assert chunk.logprobs.is_pinned()
+                assert chunk.logprob_token_ids.is_pinned()
+                torch.testing.assert_close(chunk.logprobs, values)
+                assert torch.equal(chunk.logprob_token_ids, ids)
 
 
 def test_hidden_capture_reports_sparse_positions_without_filling_gaps():
@@ -367,3 +415,54 @@ def test_hidden_capture_counts_replay_copies_without_new_tokens():
     np.testing.assert_array_equal(result.hidden_positions, [0, 1, 2, 3])
     assert result.copied_bytes == 48
     assert result.copy_ms == 3.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_window_logprobs_match_public_generation(vllm_runner):
+    """Window supervision agrees with standard raw logprobs without changing tokens."""
+    import os
+
+    from vllm import SamplingParams
+
+    model = os.environ.get("VLLM_TEST_MODEL", "Qwen/Qwen3-0.6B")
+    with vllm_runner(
+        model,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=1,
+        enforce_eager=True,
+        async_scheduling=False,
+        enable_prefix_caching=False,
+        logprobs_mode="raw_logprobs",
+        gpu_memory_utilization=0.5,
+    ) as runner:
+        llm = runner.get_llm()
+        params = SamplingParams(
+            temperature=0, max_tokens=8, ignore_eos=True, logprobs=4
+        )
+        inputs = [{"prompt_token_ids": [100, 200, 300, 400]}]
+        reference = llm.generate(inputs, params, use_tqdm=False)[0]
+        plan = HiddenStateCapturePlan.from_window(
+            "req", 4, 2, 6, "regression", min_rows=4, logprob_topk=4
+        )
+        actual = llm.generate(
+            inputs, params, hidden_state_capture=plan, use_tqdm=False
+        )[0]
+        assert actual.outputs[0].token_ids == reference.outputs[0].token_ids
+        result = actual.hidden_state_capture
+        assert result is not None, actual.hidden_capture_skip_reason
+        np.testing.assert_array_equal(result.hidden_positions, [5, 6, 7, 8])
+        assert result.logprobs.shape == result.logprob_token_ids.shape == (4, 4)
+        for row, values, ids in zip(
+            actual.outputs[0].logprobs[2:6], result.logprobs, result.logprob_token_ids
+        ):
+            expected = sorted(row, key=lambda token: row[token].logprob, reverse=True)[
+                :4
+            ]
+            assert set(ids.tolist()) == set(expected)
+            torch.testing.assert_close(
+                values,
+                torch.tensor([row[token].logprob for token in ids.tolist()]),
+                atol=2e-5,
+                rtol=1e-5,
+            )

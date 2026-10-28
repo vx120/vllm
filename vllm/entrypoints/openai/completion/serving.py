@@ -212,6 +212,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         min_rows=capture.min_rows,
                         aux_layer_ids=capture.aux_layer_ids,
                         hidden_layout=capture.hidden_layout,
+                        logprob_topk=capture.logprob_topk,
                     )
                 except ValueError as exc:
                     return self.create_error_response(str(exc))
@@ -758,6 +759,16 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     collection_id=capture.collection_id,
                     copied_bytes=capture.copied_bytes,
                     copy_ms=capture.copy_ms,
+                    logprobs=(
+                        capture.logprobs.tolist()
+                        if capture.logprobs is not None
+                        else None
+                    ),
+                    logprob_token_ids=(
+                        capture.logprob_token_ids.tolist()
+                        if capture.logprob_token_ids is not None
+                        else None
+                    ),
                 )
                 if last_final_res is not None
                 and (capture := last_final_res.hidden_state_capture) is not None

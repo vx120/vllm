@@ -52,6 +52,7 @@ class HiddenStateCaptureWindowRequest(OpenAIBaseModel):
     coordinate: Literal["response", "absolute"] = "response"
     collection_id: str
     min_rows: int = Field(default=1, ge=1)
+    logprob_topk: int = Field(default=0, ge=0)
     aux_layer_ids: tuple[int, ...] = ()
     hidden_layout: Literal["final", "aux_final", "dflash_aux"] | None = None
 
@@ -729,6 +730,9 @@ class HiddenStateCaptureResponse(OpenAIBaseModel):
     collection_id: str
     copied_bytes: int
     copy_ms: float
+    logprobs: list[list[float]] | None = None
+    logprob_token_ids: list[list[int]] | None = None
+    logprob_mode: Literal["raw_logprobs"] = "raw_logprobs"
 
 
 class CompletionResponse(OpenAIBaseModel):

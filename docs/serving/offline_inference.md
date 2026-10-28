@@ -114,3 +114,26 @@ This API adds several batteries-included capabilities that simplify large-scale,
     ```
 
 For more information about the Ray Data LLM API, see the [Ray Data LLM documentation](https://docs.ray.io/en/latest/data/working-with-llms.html).
+
+### Window-aligned top-k logprobs
+
+Set `logprob_topk=128` on `HiddenStateCapturePlan.from_window(...)` to export
+raw model log probabilities alongside hidden states. The default, `0`, disables
+this export. `result.logprobs` (CPU float32) and `result.logprob_token_ids`
+(CPU int64) have shape `[captured_rows, logprob_topk]`. Row `i` describes the
+next-token distribution predicted by `result.hidden_positions[i]`, so response
+token `r` uses predictor position `prompt_len - 1 + r`. Acceptance filtering and
+retry deduplication apply to all three tensors together.
+
+These values are normalized over the full vocabulary before selecting top-k;
+the exported subset is not renormalized. They are captured before grammar masks,
+temperature, top-p/top-k sampling filters, or penalties. The existing forward
+logits are reused; no second LM-head forward is required. Only window rows are
+normalized and transferred. Each exported row adds `12 * logprob_topk` bytes
+to GPU-to-CPU transfer (float32 values and int64 token IDs).
+
+The non-streaming `/v1/completions` extension accepts the same `logprob_topk`
+in `hidden_state_capture`, and returns `logprobs`, `logprob_token_ids`, and
+`logprob_mode: "raw_logprobs"` in its capture result. This is independent of
+the usual per-completion `logprobs` option. The existing capture restrictions
+also apply; window logprobs additionally reject batch-sharded sampling.
